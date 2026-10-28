@@ -1,0 +1,508 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+PROVIDERS = ("openai", "anthropic", "openrouter", "openai-compatible")
+ENV_KEYS = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "openai-compatible": "EVERUN_API_KEY",
+}
+DEFAULT_BASE_URLS = {
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+}
+
+
+class EmptyModelResponse(RuntimeError):
+    def __init__(self, message: str, *, response_id: str | None = None, usage: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.response_id = response_id
+        self.usage = usage or {}
+
+
+def config_home() -> Path:
+    return Path(os.environ.get("EVERUN_HOME", Path.home() / ".everrun"))
+
+
+def _auth_path() -> Path:
+    return config_home() / "auth.json"
+
+
+def load_auth() -> dict[str, Any]:
+    path = _auth_path()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+
+
+def save_key(provider: str, api_key: str) -> None:
+    if provider not in PROVIDERS:
+        raise ValueError(f"Unsupported provider {provider!r}; choose from {', '.join(PROVIDERS)}")
+    if not api_key.strip():
+        raise ValueError("API key cannot be empty")
+    auth = load_auth()
+    auth[provider] = {"auth_type": "api_key", "api_key": api_key.strip()}
+    save_auth(auth)
+
+
+def configure_provider(provider: str, *, api_key: str | None = None, base_url: str | None = None) -> None:
+    if provider not in PROVIDERS:
+        raise ValueError(f"Unsupported provider {provider!r}; choose from {', '.join(PROVIDERS)}")
+    auth = load_auth()
+    if api_key:
+        entry = {"auth_type": "api_key", "api_key": api_key.strip()}
+    else:
+        entry = auth.setdefault(provider, {})
+    if base_url:
+        if provider != "openai-compatible":
+            raise ValueError("A custom base URL is currently supported only for openai-compatible")
+        entry["base_url"] = base_url.rstrip("/")
+    auth[provider] = entry
+    save_auth(auth)
+
+
+def is_connected(provider: str) -> bool:
+    entry = load_auth().get(provider, {})
+    key = os.environ.get(ENV_KEYS[provider]) or entry.get("api_key")
+    if provider == "openai-compatible":
+        return bool(entry.get("base_url") or os.environ.get("EVERUN_BASE_URL"))
+    if provider == "openai" and entry.get("auth_type") == "oauth":
+        return bool(entry.get("refresh_token") and "chatgpt.tokens.use.direct" in entry.get("scopes", []))
+    return bool(key)
+
+
+def save_auth(auth: dict[str, Any]) -> None:
+    path = _auth_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(auth, indent=2) + "\n", encoding="utf-8")
+    try:
+        temporary.chmod(0o600)
+    except OSError:
+        pass
+    temporary.replace(path)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def default_model(provider: str) -> str | None:
+    value = load_auth().get("_defaults", {}).get(provider)
+    return str(value) if value else None
+
+
+def default_provider() -> str | None:
+    value = load_auth().get("_defaults", {}).get("provider")
+    return str(value) if value else None
+
+
+def save_default_model(provider: str, model: str) -> None:
+    auth = load_auth()
+    defaults = auth.setdefault("_defaults", {})
+    defaults[provider] = model
+    auth["_defaults"] = defaults
+    save_auth(auth)
+
+
+def save_default_provider(provider: str) -> None:
+    auth = load_auth()
+    defaults = auth.setdefault("_defaults", {})
+    defaults["provider"] = provider
+    auth["_defaults"] = defaults
+    save_auth(auth)
+
+
+def remove_key(provider: str) -> None:
+    auth = load_auth()
+    auth.pop(provider, None)
+    path = _auth_path()
+    if auth:
+        save_auth(auth)
+    elif path.exists():
+        path.unlink()
+
+
+def _credential(provider: str) -> str:
+    env_key = ENV_KEYS[provider]
+    key = os.environ.get(env_key)
+    if key:
+        return key
+    entry = load_auth().get(provider, {})
+    if provider == "openai" and entry.get("auth_type") == "oauth":
+        from .auth import openai_access_token
+        return openai_access_token()
+    key = entry.get("api_key")
+    if not key:
+        if provider == "openai-compatible":
+            if os.environ.get("EVERUN_BASE_URL") or entry.get("base_url"):
+                return ""
+            raise RuntimeError(f"Configure a base URL with `everrun auth set {provider}`")
+        raise RuntimeError(f"Connect {provider} with `everrun auth set {provider}` or set {env_key}")
+    return str(key)
+
+
+def _base_url(provider: str) -> str:
+    if provider == "openai-compatible":
+        value = os.environ.get("EVERUN_BASE_URL") or load_auth().get(provider, {}).get("base_url")
+        if not value:
+            raise RuntimeError("Set EVERUN_BASE_URL or configure a base URL with `everrun auth set openai-compatible`")
+        return str(value).rstrip("/")
+    return DEFAULT_BASE_URLS[provider]
+
+
+def _request_timeout() -> int:
+    try:
+        value = int(os.environ.get("EVERUN_REQUEST_TIMEOUT", "900"))
+    except ValueError:
+        value = 900
+    return max(60, min(3600, value))
+
+
+def _request(url: str, *, headers: dict[str, str], data: dict[str, Any] | None = None) -> dict[str, Any]:
+    body = json.dumps(data).encode("utf-8") if data is not None else None
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST" if body is not None else "GET")
+    try:
+        with urllib.request.urlopen(request, timeout=_request_timeout()) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{url} returned HTTP {exc.code}: {details[:1500]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach model provider at {url}: {exc.reason}") from exc
+
+
+def list_models(provider: str) -> list[dict[str, str]]:
+    if provider not in PROVIDERS:
+        raise ValueError(f"Unsupported provider {provider!r}; choose from {', '.join(PROVIDERS)}")
+    base = _base_url(provider)
+    key = _credential(provider)
+    headers = {"Authorization": f"Bearer {key}"}
+    if not key:
+        headers = {}
+    if provider == "anthropic":
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    if provider == "openrouter":
+        headers["HTTP-Referer"] = "https://github.com/seanbenhur/everrun"
+        headers["X-Title"] = "Everrun"
+    response = _request(f"{base}/models", headers=headers)
+    raw = response.get("data", response.get("models", []))
+    chatgpt_plan = provider == "openai" and load_auth().get("openai", {}).get("auth_type") == "oauth" and not os.environ.get("OPENAI_API_KEY")
+    models: list[dict[str, str]] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if chatgpt_plan and item.get("visibility") != "list":
+            continue
+        model_id = item.get("id") or item.get("slug")
+        if not isinstance(model_id, str):
+            continue
+        name = item.get("display_name") or item.get("name") or model_id
+        models.append({"id": model_id, "name": str(name)})
+    return models if chatgpt_plan else sorted(models, key=lambda item: item["name"].lower())
+
+
+def _openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"type": "function", "function": tool} for tool in tools]
+
+
+def _anthropic_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"name": t["name"], "description": t["description"], "input_schema": t["parameters"]} for t in tools]
+
+
+def _sse_events(request: urllib.request.Request, provider: str):
+    try:
+        with urllib.request.urlopen(request, timeout=_request_timeout()) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                if payload:
+                    yield json.loads(payload)
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{provider} returned HTTP {exc.code}: {details[:1500]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach {provider}: {exc.reason}") from exc
+
+
+def _openai_responses_complete(model: str, history: list[dict[str, Any]], tools: list[dict[str, Any]], system: str,
+                               *, stream_output: bool = True) -> dict[str, Any]:
+    api_tools = [{"type": "function", "name": tool["name"], "description": tool["description"],
+                  "parameters": tool["parameters"], "strict": False} for tool in tools]
+    # Responses API function definitions belong in the top-level `tools`
+    # argument. Putting them in `input` as a made-up `additional_tools` item
+    # can produce responses that finish without invoking Everrun's tools.
+    body = {"model": model, "instructions": system, "input": list(history),
+            "store": False, "stream": True}
+    if api_tools:
+        body["tools"] = api_tools
+        body["tool_choice"] = "auto"
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {_credential('openai')}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    completed = None
+    text_deltas: list[str] = []
+    finalized_text: dict[tuple[int, int], str] = {}
+    streamed_items: dict[int, dict[str, Any]] = {}
+    streamed_text = False
+    try:
+        with urllib.request.urlopen(request, timeout=_request_timeout()) as response:
+            data = ""
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    continue
+                event = json.loads(data)
+                if event.get("type") == "response.output_text.delta":
+                    delta = event.get("delta", "")
+                    if delta:
+                        text_deltas.append(str(delta))
+                        if stream_output:
+                            sys.stdout.write(str(delta))
+                            sys.stdout.flush()
+                            streamed_text = True
+                elif event.get("type") == "response.refusal.delta":
+                    delta = event.get("delta", "")
+                    if delta:
+                        text_deltas.append(str(delta))
+                        if stream_output:
+                            sys.stdout.write(str(delta))
+                            sys.stdout.flush()
+                            streamed_text = True
+                elif event.get("type") == "response.output_text.done":
+                    key = (int(event.get("output_index", 0)), int(event.get("content_index", 0)))
+                    finalized_text[key] = str(event.get("text") or "")
+                elif event.get("type") == "response.output_item.added":
+                    item = event.get("item")
+                    if isinstance(item, dict):
+                        streamed_items[int(event.get("output_index", len(streamed_items)))] = item
+                elif event.get("type") == "response.output_item.done":
+                    item = event.get("item")
+                    if isinstance(item, dict):
+                        streamed_items[int(event.get("output_index", len(streamed_items)))] = item
+                elif event.get("type") == "response.function_call_arguments.done":
+                    index = int(event.get("output_index", -1))
+                    if index in streamed_items:
+                        streamed_items[index]["arguments"] = event.get("arguments", "")
+                elif event.get("type") in {"response.completed", "response.incomplete"}:
+                    completed = event.get("response")
+                elif event.get("type") == "response.failed":
+                    error = event.get("response", {}).get("error") or {}
+                    raise RuntimeError(f"OpenAI model request failed: {error.get('code') or error.get('message') or event}")
+                elif event.get("type") == "error":
+                    raise RuntimeError(f"OpenAI model request failed: {event.get('message') or event}")
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI Responses API returned HTTP {exc.code}: {details[:1500]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach OpenAI Responses API: {exc.reason}") from exc
+    if not completed:
+        raise RuntimeError("OpenAI Responses stream ended without response.completed")
+    if streamed_text:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    output = completed.get("output") or [streamed_items[index] for index in sorted(streamed_items)]
+    text = "".join(
+        str(part.get("text") or part.get("refusal") or "")
+        for item in output if item.get("type") == "message"
+        for part in item.get("content", []) if part.get("type") in {"output_text", "refusal"}
+    )
+    if not text and finalized_text:
+        text = "".join(finalized_text[index] for index in sorted(finalized_text))
+    if not text:
+        text = str(completed.get("output_text") or "".join(text_deltas))
+    calls = []
+    for item in output:
+        if item.get("type") != "function_call":
+            continue
+        try:
+            arguments = json.loads(item.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            arguments = {"_invalid_json": item.get("arguments", "")}
+        calls.append({"id": item.get("call_id") or item.get("id"), "name": item.get("name"),
+                      "arguments": arguments})
+    history_items = output
+    if text and not history_items:
+        history_items = [{"type": "message", "role": "assistant",
+                          "content": [{"type": "output_text", "text": text}]}]
+    if not text and not calls:
+        item_types = sorted({str(item.get("type", "unknown")) for item in history_items if isinstance(item, dict)})
+        incomplete = completed.get("incomplete_details")
+        error = completed.get("error")
+        raise EmptyModelResponse(
+            f"OpenAI response {completed.get('id', '<unknown>')} ended without user-visible text or tool calls. "
+            f"Status: {completed.get('status', '<unknown>')}; output item types: {item_types or 'none'}; "
+            f"captured {len(streamed_items)} stream items and {len(text_deltas)} text deltas; "
+            f"incomplete details: {incomplete or 'none'}; error: {error or 'none'}.",
+            response_id=completed.get("id"),
+            usage=completed.get("usage"),
+        )
+    return {"text": text, "tool_calls": calls, "raw": output, "history_items": history_items, "streamed": streamed_text,
+            "finish_reason": "tool_calls" if calls else ("length" if completed.get("status") == "incomplete" else "stop"),
+            "response_id": completed.get("id"), "usage": completed.get("usage")}
+
+
+def complete(provider: str, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]], system: str,
+             *, stream_output: bool = True) -> dict[str, Any]:
+    if provider not in PROVIDERS:
+        raise ValueError(f"Unsupported provider {provider!r}; choose from {', '.join(PROVIDERS)}")
+    if provider == "openai":
+        return _openai_responses_complete(model, messages, tools, system, stream_output=stream_output)
+    base = _base_url(provider)
+    key = _credential(provider)
+    if provider == "anthropic":
+        data = {"model": model, "max_tokens": 8192, "system": system, "messages": messages, "stream": True}
+        if tools:
+            data["tools"] = _anthropic_tools(tools)
+        request = urllib.request.Request(
+            f"{base}/messages", data=json.dumps(data).encode("utf-8"),
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            method="POST",
+        )
+        blocks_by_index: dict[int, dict[str, Any]] = {}
+        stop_reason = None
+        completed = False
+        streamed = False
+        usage: dict[str, Any] = {}
+        for event in _sse_events(request, "Anthropic Messages API"):
+            kind = event.get("type")
+            if kind == "message_start":
+                usage.update((event.get("message") or {}).get("usage") or {})
+            elif kind == "content_block_start":
+                blocks_by_index[int(event["index"])] = dict(event.get("content_block") or {})
+                block = blocks_by_index[int(event["index"])]
+                if block.get("type") == "tool_use":
+                    block["partial_json"] = ""
+            elif kind == "content_block_delta":
+                index = int(event["index"])
+                block = blocks_by_index.setdefault(index, {"type": "text", "text": ""})
+                delta = event.get("delta") or {}
+                if delta.get("type") == "text_delta":
+                    text_delta = str(delta.get("text") or "")
+                    block["text"] = str(block.get("text") or "") + text_delta
+                    if text_delta and stream_output:
+                        sys.stdout.write(text_delta)
+                        sys.stdout.flush()
+                        streamed = True
+                elif delta.get("type") == "input_json_delta":
+                    block["partial_json"] = str(block.get("partial_json") or "") + str(delta.get("partial_json") or "")
+            elif kind == "content_block_stop":
+                block = blocks_by_index.get(int(event["index"]), {})
+                if block.get("type") == "tool_use":
+                    try:
+                        block["input"] = json.loads(block.pop("partial_json", "") or "{}")
+                    except json.JSONDecodeError:
+                        block["input"] = {"_invalid_json": block.pop("partial_json", "")}
+            elif kind == "message_delta":
+                stop_reason = (event.get("delta") or {}).get("stop_reason")
+                usage.update(event.get("usage") or {})
+            elif kind == "message_stop":
+                completed = True
+            elif kind == "error":
+                raise RuntimeError(f"Anthropic model request failed: {event.get('error') or event}")
+        if not completed:
+            raise RuntimeError("Anthropic stream ended without message_stop")
+        if streamed:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        blocks = [blocks_by_index[index] for index in sorted(blocks_by_index)]
+        text = "".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+        calls = [{"id": block["id"], "name": block["name"], "arguments": block.get("input", {})}
+                 for block in blocks if block.get("type") == "tool_use"]
+        return {"text": text, "tool_calls": calls, "raw": blocks,
+                "assistant_message": {"role": "assistant", "content": blocks},
+                "finish_reason": stop_reason, "streamed": streamed, "usage": usage}
+
+    headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
+    if not key:
+        headers.pop("Authorization")
+    if provider == "openrouter":
+        headers["HTTP-Referer"] = "https://github.com/seanbenhur/everrun"
+        headers["X-Title"] = "Everrun"
+    request_body = {"model": model, "messages": [{"role": "system", "content": system}, *messages],
+                    "stream": True}
+    if tools:
+        request_body["tools"] = _openai_tools(tools)
+        request_body["tool_choice"] = "auto"
+    if provider == "openrouter":
+        request_body["stream_options"] = {"include_usage": True}
+    request = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=json.dumps(request_body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    content_parts: list[str] = []
+    tool_parts: dict[int, dict[str, Any]] = {}
+    finish_reason = None
+    usage: dict[str, Any] = {}
+    for event in _sse_events(request, provider):
+        if event.get("error") or event.get("type") == "error":
+            detail = event.get("error") or event.get("message") or event
+            raise RuntimeError(f"{provider} model request failed: {detail}")
+        if isinstance(event.get("usage"), dict):
+            usage.update(event["usage"])
+        choices = event.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            content_parts.append(content)
+            if stream_output:
+                sys.stdout.write(content)
+                sys.stdout.flush()
+        for part in delta.get("tool_calls", []):
+            index = int(part.get("index", 0))
+            current = tool_parts.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+            if part.get("id"):
+                current["id"] = part["id"]
+            function = part.get("function") or {}
+            current["function"]["name"] += str(function.get("name") or "")
+            current["function"]["arguments"] += str(function.get("arguments") or "")
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+    streamed = bool(content_parts and stream_output)
+    if streamed:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    message = {"role": "assistant", "content": "".join(content_parts) or None}
+    if tool_parts:
+        message["tool_calls"] = [tool_parts[index] for index in sorted(tool_parts)]
+    calls = []
+    for call in message.get("tool_calls", []):
+        fn = call.get("function", {})
+        try:
+            arguments = json.loads(fn.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            arguments = {"_invalid_json": fn.get("arguments", "")}
+        calls.append({"id": call["id"], "name": fn.get("name", ""), "arguments": arguments})
+    return {"text": message.get("content") or "", "tool_calls": calls, "raw": message,
+            "assistant_message": message, "finish_reason": finish_reason,
+            "streamed": streamed, "usage": usage}

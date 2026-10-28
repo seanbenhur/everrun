@@ -6,3 +6,6 @@ __pycache__/
 build/
 dist/
 .DS_Store
+/auth.json
+/state.sqlite3*
+/.everrun/

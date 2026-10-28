@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
-import shutil
 import subprocess
 import sys
 import uuid
 from pathlib import Path
 
+from . import __version__
+from .auth import login_openai
 from .git import prepare_worktree
+from .providers import PROVIDERS, configure_provider, default_model, default_provider, is_connected, list_models, load_auth, remove_key, save_default_model, save_default_provider
 from .runner import run_task, task_home
 from .store import Store
+from .terminal import TerminalUI
 
 
 def _git_root(repo: Path) -> Path:
@@ -21,90 +25,279 @@ def _git_root(repo: Path) -> Path:
     return Path(p.stdout.strip()).resolve()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(prog="everrun", description="Persistent local coding task harness")
-    sub = parser.add_subparsers(dest="command", required=True)
-    start = sub.add_parser("run", help="Create an isolated task and start the agent")
+def _provider_name(value: str) -> str:
+    if value not in PROVIDERS:
+        raise argparse.ArgumentTypeError(f"Choose one of: {', '.join(PROVIDERS)}")
+    return value
+
+
+def _interactive() -> argparse.Namespace:
+    repo = _git_root(Path.cwd())
+    existing = [item for item in Store().list()
+                if Path(item["repo"]).resolve() == repo
+                and item["status"] in {"paused", "running", "waiting_for_input"}]
+    print("Everrun · coding session")
+    print(f"Repository: {repo}")
+    print("Type /exit at the prompt to pause this session.\n")
+    if existing:
+        print("Saved sessions:")
+        for item in existing[:10]:
+            print(f"  {item['id']}  {item['status']}  {item['goal']}")
+        selected = input("Resume a session by ID, or press Enter for a new one: ").strip()
+        if selected:
+            match = next((item for item in existing if item["id"] == selected), None)
+            if not match:
+                raise RuntimeError(f"No resumable session {selected!r} for this repository")
+            return argparse.Namespace(command="resume", task_id=selected, answer=None, model=None,
+                                      batch=False)
+    configured_provider = os.environ.get("EVERUN_PROVIDER") or default_provider()
+    provider = configured_provider
+    if not provider:
+        connected = [candidate for candidate in PROVIDERS if is_connected(candidate)]
+        if len(connected) == 1:
+            provider = connected[0]
+        elif len(connected) > 1:
+            print("Connected providers:")
+            for candidate in connected:
+                print(f"  {candidate}")
+            while True:
+                provider = input(f"Provider [{connected[0]}]: ").strip() or connected[0]
+                if provider in connected:
+                    break
+                print(f"Choose one of: {', '.join(connected)}")
+        else:
+            provider = "openai"
+    if provider not in PROVIDERS:
+        raise RuntimeError(f"Unknown EVERUN_PROVIDER {provider!r}; choose from {', '.join(PROVIDERS)}")
+    if not is_connected(provider):
+        action = "everrun auth login openai" if provider == "openai" else f"everrun auth set {provider}"
+        raise RuntimeError(f"No {provider} account is connected. Connect it with `{action}`, then start Everrun again.")
+
+    model = os.environ.get("EVERUN_MODEL") or default_model(provider)
+    if not model:
+        available = list_models(provider)
+        if not available:
+            raise RuntimeError(f"No models are available from {provider}.")
+        print("Available models:")
+        for item in available[:20]:
+            print(f"  {item['id']}  ({item['name']})")
+        model = input(f"\nModel [{available[0]['id']}]: ").strip() or available[0]["id"]
+        save_default_model(provider, model)
+    if not configured_provider:
+        save_default_provider(provider)
+    print(f"Using {provider}/{model}.\n")
+    return argparse.Namespace(command="chat", goal=None,
+                              repo=str(repo), accept=[], provider=provider, model=model,
+                              auto_approve=os.environ.get("EVERUN_AUTO_APPROVE", "").lower()
+                              in {"1", "true", "yes"})
+
+
+def _main(*, ui: TerminalUI | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="everrun", description="A persistent coding harness powered directly by model providers")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = parser.add_subparsers(dest="command")
+
+    start = sub.add_parser("run", help="Start a model-driven coding task")
     start.add_argument("goal", help="Task goal")
     start.add_argument("--repo", default=".", help="Git repository (default: current directory)")
     start.add_argument("--accept", action="append", default=[], help="Acceptance criterion; repeat as needed")
-    start.add_argument("--agent", choices=["codex", "claude"], default=os.environ.get("EVERUN_AGENT", os.environ.get("RELAY_AGENT", "codex")), help="Installed coding agent CLI to run")
-    start.add_argument("--model", default=os.environ.get("EVERUN_MODEL", os.environ.get("RELAY_MODEL")), help="Optional model name understood by the selected agent")
-    resume = sub.add_parser("resume", help="Resume a paused or input-waiting task")
+    start.add_argument("--provider", type=_provider_name, default=os.environ.get("EVERUN_PROVIDER", "openai"), help="Model provider")
+    start.add_argument("--model", default=os.environ.get("EVERUN_MODEL"), help="Model ID from `everrun models`")
+    start.add_argument("--auto-approve", action="store_true", help="Run shell tool calls without asking each time")
+
+    resume = sub.add_parser("resume", help="Reopen a paused persistent coding session")
     resume.add_argument("task_id")
     resume.add_argument("--answer", help="Answer the task's pending question")
-    resume.add_argument("--model", help="Switch to a model supported by the task's selected agent")
+    resume.add_argument("--model", help="Switch to a model from the same provider")
+    resume.add_argument("--batch", action="store_true", help="Resume autonomously until completion or another pause")
+
+    models = sub.add_parser("models", help="List models available from a connected provider")
+    models.add_argument("--provider", type=_provider_name, default=os.environ.get("EVERUN_PROVIDER", "openai"))
+
+    auth = sub.add_parser("auth", help="Connect or disconnect a model provider")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+    login = auth_sub.add_parser("login", help="Sign in with ChatGPT for eligible OpenAI model usage")
+    login.add_argument("provider", choices=["openai"])
+    set_key = auth_sub.add_parser("set", help="Save a provider API key")
+    set_key.add_argument("provider", type=_provider_name)
+    set_key.add_argument("--base-url", help="Required for openai-compatible providers")
+    auth_sub.add_parser("status", help="Show connected providers")
+    logout = auth_sub.add_parser("logout", help="Remove saved credentials for a provider")
+    logout.add_argument("provider", type=_provider_name)
+
     status = sub.add_parser("status", help="Show task state")
     status.add_argument("task_id", nargs="?")
     report = sub.add_parser("report", help="Print the final review report")
     report.add_argument("task_id")
-    sub.add_parser("agents", help="Show supported coding agent CLIs found on PATH")
     sub.add_parser("list", help="List tasks")
     args = parser.parse_args()
+    if args.command is None:
+        try:
+            args = _interactive()
+        except Exception as exc:
+            print(f"everrun: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+
     store = Store()
     try:
         if args.command == "run":
+            if not args.model:
+                raise RuntimeError("Choose a model with `everrun models --provider <provider>`, then pass `--model <model-id>`")
+            if not is_connected(args.provider):
+                if args.provider == "openai":
+                    raise RuntimeError("Connect with `everrun auth login openai` or save an API key with `everrun auth set openai`")
+                raise RuntimeError(f"Connect with `everrun auth set {args.provider}` before starting a task")
             repo = _git_root(Path(args.repo).resolve())
-            # Reserve the ID before creating a worktree so its branch and directory are stable.
             task_id = uuid.uuid4().hex[:10]
             worktree, base = prepare_worktree(repo, task_id)
-            store.db.execute("INSERT INTO tasks(id,goal,acceptance,repo,worktree,base_commit,status,model,agent,created,updated) VALUES(?,?,?,?,?,?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
-                             (task_id, args.goal, json.dumps(args.accept), str(repo), str(worktree), base, "running", args.model or "", args.agent))
+            store.db.execute(
+                "INSERT INTO tasks(id,goal,acceptance,repo,worktree,base_commit,status,model,provider,auto_approve,created,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
+                (task_id, args.goal, json.dumps(args.accept), str(repo), str(worktree), base,
+                 "running", args.model, args.provider, int(args.auto_approve)),
+            )
             store.db.commit()
-            store.event(task_id, "created", {"goal": args.goal, "acceptance": args.accept, "base_commit": base})
+            store.event(task_id, "created", {"goal": args.goal, "acceptance": args.accept, "base_commit": base,
+                                               "provider": args.provider, "model": args.model})
             print(f"Created task {task_id}")
-            try:
-                run_task(task_id)
-            except KeyboardInterrupt:
-                store.update(task_id, status="paused")
-                store.event(task_id, "interrupted", {})
-                print(f"Paused. Resume with: everrun resume {task_id}")
-            except Exception as e:
-                store.update(task_id, status="paused")
-                store.event(task_id, "runtime_error", {"error": str(e)})
-                raise
+            run_task(task_id)
+        elif args.command == "chat":
+            repo = _git_root(Path(args.repo).resolve())
+
+            def start_session() -> None:
+                if not args.goal:
+                    while True:
+                        prompt = input("You> ").strip()
+                        if prompt == "/help":
+                            print("Type a coding request to start. In a session: /help, /exit, /done.")
+                            continue
+                        if prompt == "/exit":
+                            print("No session started.")
+                            return
+                        if prompt:
+                            args.goal = prompt
+                            break
+                        print("Enter a message, or use /exit to leave.")
+                task_id = uuid.uuid4().hex[:10]
+                worktree, base = prepare_worktree(repo, task_id)
+                store.db.execute(
+                    "INSERT INTO tasks(id,goal,acceptance,repo,worktree,base_commit,status,model,provider,auto_approve,created,updated) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,strftime('%s','now'),strftime('%s','now'))",
+                    (task_id, args.goal, json.dumps(args.accept), str(repo), str(worktree), base,
+                     "running", args.model, args.provider, int(args.auto_approve)),
+                )
+                store.db.commit()
+                store.event(task_id, "created", {"goal": args.goal, "acceptance": args.accept,
+                                                   "base_commit": base, "provider": args.provider,
+                                                   "model": args.model, "interactive": True})
+                print(f"Everrun session {task_id} · {args.provider}/{args.model}")
+                print(f"Working in {worktree}. Use /help for session commands.\n")
+                run_task(task_id, interactive=True, on_status=ui.set_status if ui else None)
+
+            if sys.stdin.isatty() and sys.stdout.isatty():
+                if ui is None:
+                    TerminalUI(f"Everrun · {repo.name} · {args.provider}/{args.model}").run(start_session)
+                else:
+                    ui.title = f"Everrun · {repo.name} · {args.provider}/{args.model}"
+                    start_session()
+            else:
+                start_session()
         elif args.command == "resume":
             task = store.get(args.task_id)
             if not task:
                 raise RuntimeError(f"Unknown task {args.task_id}")
             if args.model:
                 store.update(args.task_id, model=args.model)
-            try:
-                run_task(args.task_id, answer=args.answer)
-            except KeyboardInterrupt:
-                store.update(args.task_id, status="paused")
-                store.event(args.task_id, "interrupted", {})
-                print(f"Paused. Resume with: everrun resume {args.task_id}")
-            except Exception as e:
-                store.update(args.task_id, status="paused")
-                store.event(args.task_id, "runtime_error", {"error": str(e)})
-                raise
+            def resume_session() -> None:
+                run_task(args.task_id, answer=args.answer, interactive=not args.batch,
+                         on_status=ui.set_status if ui else None)
+
+            if not args.batch and sys.stdin.isatty() and sys.stdout.isatty():
+                if ui is None:
+                    TerminalUI(f"Everrun · {Path(task['repo']).name} · {task['provider']}/{task['model']}").run(resume_session)
+                else:
+                    ui.title = f"Everrun · {Path(task['repo']).name} · {task['provider']}/{task['model']}"
+                    resume_session()
+            else:
+                resume_session()
+        elif args.command == "models":
+            for model in list_models(args.provider):
+                print(f"{model['id']}\t{model['name']}")
+        elif args.command == "auth":
+            if args.auth_command == "login":
+                login_openai()
+            elif args.auth_command == "set":
+                base_url = args.base_url
+                if args.provider == "openai-compatible":
+                    if not base_url:
+                        base_url = input("OpenAI-compatible base URL: ").strip()
+                    api_key = getpass.getpass("API key (leave blank if not required): ")
+                else:
+                    api_key = getpass.getpass(f"{args.provider} API key: ")
+                configure_provider(args.provider, api_key=api_key or None, base_url=base_url)
+                print(f"Connected {args.provider}.")
+            elif args.auth_command == "status":
+                for provider in PROVIDERS:
+                    if provider == "openai":
+                        saved = load_auth().get("openai", {})
+                        if os.environ.get("OPENAI_API_KEY"):
+                            detail = "connected (OPENAI_API_KEY)"
+                        elif saved.get("auth_type") == "oauth":
+                            detail = f"connected with ChatGPT{': ' + saved['email'] if saved.get('email') else ''}"
+                        elif saved.get("api_key"):
+                            detail = "connected (saved API key)"
+                        else:
+                            detail = "not connected"
+                        print(f"{provider}: {detail}")
+                    else:
+                        print(f"{provider}: {'connected' if is_connected(provider) else 'not connected'}")
+            elif args.auth_command == "logout":
+                remove_key(args.provider)
+                print(f"Removed saved {args.provider} credentials.")
         elif args.command == "status":
             tasks = [store.get(args.task_id)] if args.task_id else store.list()
             for task in tasks:
                 if not task:
                     raise RuntimeError("Task not found")
                 if args.task_id:
-                    print(f"{task['id']}  {task['status']}  {task['goal']}\nagent: {task['agent']}  model: {task['model'] or 'default'}\nagent session: {task['agent_session'] or 'not started'}\nrepo: {task['repo']}\nworktree: {task['worktree']}\nbase: {task['base_commit']}")
+                    print(f"{task['id']}  {task['status']}  {task['goal']}\nprovider: {task['provider']}  model: {task['model']}\nrepo: {task['repo']}\nworktree: {task['worktree']}\nbase: {task['base_commit']}")
                     for event in store.events(task["id"])[-8:]:
                         print(f"  {event['kind']}: {event['payload']}")
                 else:
-                    print(f"{task['id']}  {task['status']}  {task['agent']}  {task['goal']}  [{task['repo']}]")
+                    print(f"{task['id']}  {task['status']}  {task['provider']}/{task['model']}  {task['goal']}  [{task['repo']}]")
         elif args.command == "list":
             for task in store.list():
-                print(f"{task['id']}  {task['status']}  {task['goal']}")
+                print(f"{task['id']}  {task['status']}  {task['provider']}/{task['model']}  {task['goal']}")
         elif args.command == "report":
             path = task_home(args.task_id) / "report.md"
             if not path.exists():
                 raise RuntimeError(f"No report exists for {args.task_id}")
             print(path.read_text(encoding="utf-8"))
-        elif args.command == "agents":
-            for agent, executable in (("codex", "codex"), ("claude", "claude")):
-                location = shutil.which(executable)
-                print(f"{agent}: {location or 'not found'}")
-    except Exception as e:
-        print(f"everrun: {e}", file=sys.stderr)
+        elif args.command == "quit":
+            print("No prompt entered; no session started.")
+    except Exception as exc:
+        print(f"everrun: {exc}", file=sys.stderr)
         raise SystemExit(1)
+
+
+def main() -> None:
+    # Keep the startup flow (saved sessions, provider/model setup, and chat)
+    # inside one full-screen application instead of dropping back to the shell
+    # between questions and the coding session.
+    if len(sys.argv) == 1 and sys.stdin.isatty() and sys.stdout.isatty():
+        ui = TerminalUI("Everrun · coding session")
+
+        def launch() -> None:
+            try:
+                _main(ui=ui)
+            except SystemExit as exc:
+                if exc.code:
+                    ui.write("\nPress Enter to close Everrun. ")
+                    ui.input("")
+
+        ui.run(launch)
+        return
+    _main()
 
 
 if __name__ == "__main__":

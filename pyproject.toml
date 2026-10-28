@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "everrun"
 version = "0.1.0"
-description = "A local-first harness for persistent coding tasks"
+description = "A standalone local-first coding harness with persistent model-driven tasks"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["PyJWT[crypto]>=2.10,<3"]
 
 [project.scripts]
 everrun = "everrun_harness.cli:main"
