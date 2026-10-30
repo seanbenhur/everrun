@@ -232,6 +232,9 @@ def _main(*, ui: TerminalUI | None = None) -> None:
                     if not base_url:
                         base_url = input("OpenAI-compatible base URL: ").strip()
                     api_key = getpass.getpass("API key (leave blank if not required): ")
+                elif args.provider in ("gemini", "antigravity"):
+                    label = "Antigravity" if args.provider == "antigravity" else "Gemini"
+                    api_key = getpass.getpass(f"{label} API key: ")
                 else:
                     api_key = getpass.getpass(f"{args.provider} API key: ")
                 configure_provider(args.provider, api_key=api_key or None, base_url=base_url)
@@ -246,6 +249,22 @@ def _main(*, ui: TerminalUI | None = None) -> None:
                             detail = f"connected with ChatGPT{': ' + saved['email'] if saved.get('email') else ''}"
                         elif saved.get("api_key"):
                             detail = "connected (saved API key)"
+                        else:
+                            detail = "not connected"
+                        print(f"{provider}: {detail}")
+                    elif provider in ("gemini", "antigravity"):
+                        env_var = "GEMINI_API_KEY" if provider == "gemini" else "ANTIGRAVITY_API_KEY"
+                        saved = load_auth().get(provider, {})
+                        if os.environ.get(env_var):
+                            detail = f"connected ({env_var})"
+                        elif os.environ.get("GEMINI_API_KEY"):
+                            detail = "connected (GEMINI_API_KEY)"
+                        elif os.environ.get("GOOGLE_API_KEY"):
+                            detail = "connected (GOOGLE_API_KEY)"
+                        elif saved.get("api_key"):
+                            detail = "connected (saved API key)"
+                        elif provider == "antigravity" and load_auth().get("gemini", {}).get("api_key"):
+                            detail = "connected (saved Gemini API key)"
                         else:
                             detail = "not connected"
                         print(f"{provider}: {detail}")

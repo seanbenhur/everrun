@@ -9,18 +9,36 @@ from pathlib import Path
 from typing import Any
 
 
-PROVIDERS = ("openai", "anthropic", "openrouter", "openai-compatible")
+PROVIDERS = ("openai", "anthropic", "gemini", "antigravity", "openrouter", "openai-compatible")
 ENV_KEYS = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "antigravity": "ANTIGRAVITY_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
     "openai-compatible": "EVERUN_API_KEY",
 }
 DEFAULT_BASE_URLS = {
     "openai": "https://api.openai.com/v1",
     "anthropic": "https://api.anthropic.com/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "antigravity": "https://generativelanguage.googleapis.com/v1beta/openai",
     "openrouter": "https://openrouter.ai/api/v1",
 }
+GEMINI_MODELS = [
+    {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro"},
+    {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash"},
+    {"id": "gemini-2.0-flash", "name": "Gemini 2.0 Flash"},
+    {"id": "gemini-1.5-pro", "name": "Gemini 1.5 Pro"},
+    {"id": "gemini-1.5-flash", "name": "Gemini 1.5 Flash"},
+]
+ANTIGRAVITY_MODELS = [
+    {"id": "gemini-2.5-pro", "name": "Antigravity Gemini 2.5 Pro"},
+    {"id": "gemini-2.5-flash", "name": "Antigravity Gemini 2.5 Flash"},
+    {"id": "gemini-2.0-flash", "name": "Antigravity Gemini 2.0 Flash"},
+    {"id": "gemini-1.5-pro", "name": "Antigravity Gemini 1.5 Pro"},
+    {"id": "gemini-1.5-flash", "name": "Antigravity Gemini 1.5 Flash"},
+]
 
 
 class EmptyModelResponse(RuntimeError):
@@ -75,6 +93,10 @@ def configure_provider(provider: str, *, api_key: str | None = None, base_url: s
 def is_connected(provider: str) -> bool:
     entry = load_auth().get(provider, {})
     key = os.environ.get(ENV_KEYS[provider]) or entry.get("api_key")
+    if not key and provider in ("gemini", "antigravity"):
+        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not key and provider == "antigravity":
+        key = load_auth().get("gemini", {}).get("api_key")
     if provider == "openai-compatible":
         return bool(entry.get("base_url") or os.environ.get("EVERUN_BASE_URL"))
     if provider == "openai" and entry.get("auth_type") == "oauth":
@@ -141,6 +163,8 @@ def remove_key(provider: str) -> None:
 def _credential(provider: str) -> str:
     env_key = ENV_KEYS[provider]
     key = os.environ.get(env_key)
+    if not key and provider in ("gemini", "antigravity"):
+        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if key:
         return key
     entry = load_auth().get(provider, {})
@@ -148,6 +172,8 @@ def _credential(provider: str) -> str:
         from .auth import openai_access_token
         return openai_access_token()
     key = entry.get("api_key")
+    if not key and provider == "antigravity":
+        key = load_auth().get("gemini", {}).get("api_key")
     if not key:
         if provider == "openai-compatible":
             if os.environ.get("EVERUN_BASE_URL") or entry.get("base_url"):
@@ -190,6 +216,37 @@ def _request(url: str, *, headers: dict[str, str], data: dict[str, Any] | None =
 def list_models(provider: str) -> list[dict[str, str]]:
     if provider not in PROVIDERS:
         raise ValueError(f"Unsupported provider {provider!r}; choose from {', '.join(PROVIDERS)}")
+    if provider in ("gemini", "antigravity"):
+        curated = list(ANTIGRAVITY_MODELS if provider == "antigravity" else GEMINI_MODELS)
+        base = _base_url(provider)
+        try:
+            key = _credential(provider)
+        except Exception:
+            return curated
+        headers = {"Authorization": f"Bearer {key}", "x-goog-api-key": key}
+        try:
+            response = _request(f"{base}/models", headers=headers)
+            raw = response.get("data", response.get("models", []))
+            remote: list[dict[str, str]] = []
+            for item in raw if isinstance(raw, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                model_id = item.get("id") or item.get("slug")
+                if not isinstance(model_id, str):
+                    continue
+                name = item.get("display_name") or item.get("name") or model_id
+                remote.append({"id": model_id, "name": str(name)})
+            if remote:
+                seen = set()
+                combined = []
+                for item in remote + curated:
+                    if item["id"] not in seen:
+                        seen.add(item["id"])
+                        combined.append(item)
+                return sorted(combined, key=lambda item: item["name"].lower())
+        except Exception:
+            pass
+        return curated
     base = _base_url(provider)
     key = _credential(provider)
     headers = {"Authorization": f"Bearer {key}"}
@@ -441,6 +498,8 @@ def complete(provider: str, model: str, messages: list[dict[str, Any]], tools: l
     headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
     if not key:
         headers.pop("Authorization")
+    if provider in ("gemini", "antigravity"):
+        headers["x-goog-api-key"] = key
     if provider == "openrouter":
         headers["HTTP-Referer"] = "https://github.com/seanbenhur/everrun"
         headers["X-Title"] = "Everrun"
@@ -506,3 +565,11 @@ def complete(provider: str, model: str, messages: list[dict[str, Any]], tools: l
     return {"text": message.get("content") or "", "tool_calls": calls, "raw": message,
             "assistant_message": message, "finish_reason": finish_reason,
             "streamed": streamed, "usage": usage}
+
+
+def has_antigravity_sdk() -> bool:
+    try:
+        import google.antigravity  # noqa: F401
+        return True
+    except ImportError:
+        return False

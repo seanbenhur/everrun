@@ -88,6 +88,17 @@ everrun models --provider anthropic
 
 Claude.ai subscriptions and Anthropic API access are separate products; a Claude subscription does not include Console API usage.
 
+### Google Antigravity & Gemini
+
+Connect Google Gemini models (e.g. `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.0-flash`) or the Google Antigravity SDK:
+
+```sh
+everrun auth set gemini          # or: everrun auth set antigravity
+everrun models --provider gemini
+```
+
+You can also export `GEMINI_API_KEY`, `ANTIGRAVITY_API_KEY`, or `GOOGLE_API_KEY` in your environment. Everrun can use the `google-antigravity` SDK when installed or communicate with Google's high-speed API directly.
+
 ### OpenRouter or another compatible endpoint
 
 ```sh

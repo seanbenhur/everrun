@@ -158,6 +158,72 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(result["usage"], {"prompt_tokens": 8, "completion_tokens": 2})
         self.assertTrue(request_body["stream_options"]["include_usage"])
 
+    def test_gemini_and_antigravity_credentials_and_endpoints(self):
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "gemini-key"}, clear=True):
+            self.assertTrue(providers.is_connected("gemini"))
+            self.assertTrue(providers.is_connected("antigravity"))
+            self.assertEqual(providers._credential("gemini"), "gemini-key")
+            self.assertEqual(providers._credential("antigravity"), "gemini-key")
+
+        with patch.dict(os.environ, {"GOOGLE_API_KEY": "google-key"}, clear=True):
+            self.assertTrue(providers.is_connected("gemini"))
+            self.assertTrue(providers.is_connected("antigravity"))
+            self.assertEqual(providers._credential("gemini"), "google-key")
+            self.assertEqual(providers._credential("antigravity"), "google-key")
+
+        with patch.dict(os.environ, {"ANTIGRAVITY_API_KEY": "ag-key"}, clear=True):
+            self.assertTrue(providers.is_connected("antigravity"))
+            self.assertEqual(providers._credential("antigravity"), "ag-key")
+
+        self.assertIn("generativelanguage.googleapis.com", providers._base_url("gemini"))
+        self.assertIn("generativelanguage.googleapis.com", providers._base_url("antigravity"))
+
+    def test_gemini_and_antigravity_list_models_fallbacks_to_curated(self):
+        with patch.object(providers, "_credential", side_effect=RuntimeError("no key")):
+            gemini_models = providers.list_models("gemini")
+            self.assertTrue(any(m["id"] == "gemini-2.5-pro" for m in gemini_models))
+
+            ag_models = providers.list_models("antigravity")
+            self.assertTrue(any(m["id"] == "gemini-2.5-pro" for m in ag_models))
+            self.assertTrue(any("Antigravity" in m["name"] for m in ag_models))
+
+    def test_gemini_and_antigravity_complete_streams_tool_calls_and_headers(self):
+        headers_captured: dict = {}
+        request_body: dict = {}
+        events = [
+            {"choices": [{"delta": {"content": "Inspecting... "}, "finish_reason": None}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_gemini",
+             "function": {"name": "read_file", "arguments": '{"path":"main.py"}'}}]},
+             "finish_reason": "tool_calls"}]},
+            {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5}},
+        ]
+
+        def urlopen(request, timeout):
+            headers_captured.update(dict(request.header_items()))
+            request_body.update(json.loads(request.data))
+            return FakeResponse(events)
+
+        tool = {"name": "read_file", "description": "Read file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}
+
+        for prov in ("gemini", "antigravity"):
+            headers_captured.clear()
+            request_body.clear()
+            with patch.object(providers, "_credential", return_value="test-goog-key"), \
+                    patch.object(providers.urllib.request, "urlopen", side_effect=urlopen):
+                result = providers.complete(prov, "gemini-2.5-flash", [], [tool], "system instructions",
+                                            stream_output=False)
+
+            self.assertEqual(result["text"], "Inspecting... ")
+            self.assertEqual(len(result["tool_calls"]), 1)
+            self.assertEqual(result["tool_calls"][0]["name"], "read_file")
+            self.assertEqual(result["tool_calls"][0]["arguments"], {"path": "main.py"})
+            self.assertEqual(headers_captured.get("X-goog-api-key"), "test-goog-key")
+            self.assertEqual(request_body["tools"][0]["function"]["name"], "read_file")
+
 
 if __name__ == "__main__":
     unittest.main()
