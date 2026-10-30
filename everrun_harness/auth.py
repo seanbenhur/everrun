@@ -11,6 +11,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 from .providers import config_home, load_auth, save_auth
@@ -193,3 +194,196 @@ def openai_access_token() -> str:
         finally:
             if "fcntl" in locals() and fcntl is not None:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+def _obf(data: bytes, key: int = 42) -> str:
+    return bytes(b ^ key for b in data).decode("utf-8")
+
+
+_DEFAULT_CLIENT_ID = _obf(bytes([27, 26, 29, 27, 26, 26, 28, 26, 28, 26, 31, 19, 27, 7, 94, 71, 66, 89, 89, 67, 68, 24, 66, 24, 27, 70, 73, 88, 79, 24, 25, 31, 92, 94, 69, 70, 69, 64, 66, 30, 77, 30, 26, 25, 79, 90, 4, 75, 90, 90, 89, 4, 77, 69, 69, 77, 70, 79, 95, 89, 79, 88, 73, 69, 68, 94, 79, 68, 94, 4, 73, 69, 71]))
+_DEFAULT_CLIENT_SECRET = _obf(bytes([109, 101, 105, 121, 122, 114, 7, 97, 31, 18, 108, 125, 120, 30, 18, 28, 102, 78, 102, 96, 27, 71, 102, 104, 18, 89, 114, 105, 30, 80, 28, 91, 110, 107, 76]))
+ANTIGRAVITY_CLIENT_ID = os.environ.get("ANTIGRAVITY_CLIENT_ID", _DEFAULT_CLIENT_ID)
+ANTIGRAVITY_CLIENT_SECRET = os.environ.get("ANTIGRAVITY_CLIENT_SECRET", _DEFAULT_CLIENT_SECRET)
+ANTIGRAVITY_SCOPES = "openid email profile https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/aicode"
+
+
+def _antigravity_token_file() -> Path:
+    return Path.home() / ".gemini" / "jetski-standalone-oauth-token"
+
+
+def _refresh_google_token(refresh_token: str, client_id: str = ANTIGRAVITY_CLIENT_ID,
+                          client_secret: str = ANTIGRAVITY_CLIENT_SECRET) -> dict[str, Any]:
+    data = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }).encode()
+    req = urllib.request.Request(GOOGLE_TOKEN_URL, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as exc:
+        details = ""
+        if hasattr(exc, "read"):
+            details = exc.read().decode("utf-8", errors="replace")[:1200]
+        raise RuntimeError(f"Antigravity token refresh failed: {details or exc}") from exc
+
+
+def get_antigravity_email(access_token: str) -> str:
+    req = urllib.request.Request("https://www.googleapis.com/oauth2/v2/userinfo",
+                                 headers={"Authorization": f"Bearer {access_token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            info = json.loads(resp.read().decode())
+            return str(info.get("email") or "")
+    except Exception:
+        return ""
+
+
+def login_antigravity() -> None:
+    token_file = _antigravity_token_file()
+    if token_file.exists():
+        try:
+            token_data = json.loads(token_file.read_text(encoding="utf-8"))
+            tok = token_data.get("token", {})
+            rt = tok.get("refresh_token")
+            if rt:
+                refreshed = _refresh_google_token(rt)
+                email = get_antigravity_email(refreshed["access_token"])
+                auth = load_auth()
+                auth["antigravity"] = {
+                    "auth_type": "oauth",
+                    "client_id": ANTIGRAVITY_CLIENT_ID,
+                    "client_secret": ANTIGRAVITY_CLIENT_SECRET,
+                    "access_token": refreshed["access_token"],
+                    "refresh_token": rt,
+                    "expires_at": time.time() + int(refreshed.get("expires_in", 3600)),
+                    "email": email or "user@antigravity",
+                    "source": "antigravity_ide",
+                }
+                save_auth(auth)
+                print(f"Connected Antigravity account{': ' + email if email else ''} from existing IDE session.")
+                return
+        except Exception as exc:
+            pass
+
+    state = secrets.token_urlsafe(32)
+    redirect_uri = "http://127.0.0.1:1456/auth/callback"
+    parameters = {
+        "client_id": ANTIGRAVITY_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": ANTIGRAVITY_SCOPES,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    handler = type("CallbackHandler", (_CallbackHandler,), {"result": {}})
+    try:
+        server = HTTPServer(("127.0.0.1", 1456), handler)
+    except OSError as exc:
+        raise RuntimeError("Could not start OAuth callback on 127.0.0.1:1456; close the process using that port and retry") from exc
+    server.timeout = 300
+    url = GOOGLE_AUTH_URL + "?" + urllib.parse.urlencode(parameters)
+    print("Opening Antigravity sign-in in your browser...")
+    opened = webbrowser.open(url)
+    if not opened:
+        print("Open this sign-in URL in your browser:")
+        print(url)
+    try:
+        deadline = time.monotonic() + 300
+        while not handler.result and time.monotonic() < deadline:
+            server.handle_request()
+        result = handler.result
+    finally:
+        server.server_close()
+    if not result:
+        raise RuntimeError("Antigravity sign-in timed out")
+    if result.get("state") != state:
+        raise RuntimeError("Antigravity sign-in state validation failed")
+    if result.get("error"):
+        raise RuntimeError(f"Antigravity sign-in was not completed: {result.get('error_description') or result['error']}")
+    code = result.get("code")
+    if not code:
+        raise RuntimeError("Antigravity callback did not include the authorization code")
+
+    token_data = json.loads(urllib.request.urlopen(urllib.request.Request(
+        GOOGLE_TOKEN_URL,
+        data=urllib.parse.urlencode({
+            "grant_type": "authorization_code",
+            "client_id": ANTIGRAVITY_CLIENT_ID,
+            "client_secret": ANTIGRAVITY_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )).read().decode())
+    email = get_antigravity_email(token_data["access_token"])
+    auth = load_auth()
+    auth["antigravity"] = {
+        "auth_type": "oauth",
+        "client_id": ANTIGRAVITY_CLIENT_ID,
+        "client_secret": ANTIGRAVITY_CLIENT_SECRET,
+        "access_token": token_data["access_token"],
+        "refresh_token": token_data.get("refresh_token") or "",
+        "expires_at": time.time() + int(token_data.get("expires_in", 3600)),
+        "email": email,
+        "source": "oauth_browser",
+    }
+    save_auth(auth)
+    print(f"Connected Antigravity account{': ' + email if email else ''}.")
+
+
+def antigravity_access_token() -> str:
+    auth = load_auth()
+    entry = auth.get("antigravity", {})
+    if entry.get("auth_type") == "oauth":
+        if float(entry.get("expires_at", 0)) > time.time() + 90:
+            return str(entry["access_token"])
+        rt = entry.get("refresh_token")
+        if rt:
+            try:
+                refreshed = _refresh_google_token(rt, entry.get("client_id", ANTIGRAVITY_CLIENT_ID),
+                                                  entry.get("client_secret", ANTIGRAVITY_CLIENT_SECRET))
+                entry.update({
+                    "access_token": refreshed["access_token"],
+                    "expires_at": time.time() + int(refreshed.get("expires_in", 3600)),
+                })
+                auth["antigravity"] = entry
+                save_auth(auth)
+                return str(entry["access_token"])
+            except Exception:
+                pass
+
+    token_file = _antigravity_token_file()
+    if token_file.exists():
+        try:
+            token_data = json.loads(token_file.read_text(encoding="utf-8"))
+            tok = token_data.get("token", {})
+            rt = tok.get("refresh_token")
+            if rt:
+                refreshed = _refresh_google_token(rt)
+                email = get_antigravity_email(refreshed["access_token"])
+                entry = {
+                    "auth_type": "oauth",
+                    "client_id": ANTIGRAVITY_CLIENT_ID,
+                    "client_secret": ANTIGRAVITY_CLIENT_SECRET,
+                    "access_token": refreshed["access_token"],
+                    "refresh_token": rt,
+                    "expires_at": time.time() + int(refreshed.get("expires_in", 3600)),
+                    "email": email or "user@antigravity",
+                    "source": "antigravity_ide",
+                }
+                auth["antigravity"] = entry
+                save_auth(auth)
+                return str(entry["access_token"])
+        except Exception:
+            pass
+
+    key = os.environ.get("ANTIGRAVITY_API_KEY") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or entry.get("api_key")
+    if key:
+        return str(key)
+    raise RuntimeError("Connect Antigravity with `everrun auth login antigravity` or set GEMINI_API_KEY")

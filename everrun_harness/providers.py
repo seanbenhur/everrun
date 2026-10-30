@@ -101,6 +101,15 @@ def is_connected(provider: str) -> bool:
         return bool(entry.get("base_url") or os.environ.get("EVERUN_BASE_URL"))
     if provider == "openai" and entry.get("auth_type") == "oauth":
         return bool(entry.get("refresh_token") and "chatgpt.tokens.use.direct" in entry.get("scopes", []))
+    if provider == "antigravity":
+        if entry.get("auth_type") == "oauth" and entry.get("refresh_token"):
+            return True
+        from .auth import _antigravity_token_file
+        try:
+            if _antigravity_token_file().exists():
+                return True
+        except Exception:
+            pass
     return bool(key)
 
 
@@ -171,6 +180,12 @@ def _credential(provider: str) -> str:
     if provider == "openai" and entry.get("auth_type") == "oauth":
         from .auth import openai_access_token
         return openai_access_token()
+    if provider == "antigravity" and (entry.get("auth_type") == "oauth" or not entry.get("api_key")):
+        from .auth import antigravity_access_token
+        try:
+            return antigravity_access_token()
+        except Exception:
+            pass
     key = entry.get("api_key")
     if not key and provider == "antigravity":
         key = load_auth().get("gemini", {}).get("api_key")
@@ -179,6 +194,8 @@ def _credential(provider: str) -> str:
             if os.environ.get("EVERUN_BASE_URL") or entry.get("base_url"):
                 return ""
             raise RuntimeError(f"Configure a base URL with `everrun auth set {provider}`")
+        if provider == "antigravity":
+            raise RuntimeError("Connect Antigravity with `everrun auth login antigravity` or set GEMINI_API_KEY")
         raise RuntimeError(f"Connect {provider} with `everrun auth set {provider}` or set {env_key}")
     return str(key)
 
@@ -499,7 +516,8 @@ def complete(provider: str, model: str, messages: list[dict[str, Any]], tools: l
     if not key:
         headers.pop("Authorization")
     if provider in ("gemini", "antigravity"):
-        headers["x-goog-api-key"] = key
+        if not key.startswith("ya29."):
+            headers["x-goog-api-key"] = key
     if provider == "openrouter":
         headers["HTTP-Referer"] = "https://github.com/seanbenhur/everrun"
         headers["X-Title"] = "Everrun"

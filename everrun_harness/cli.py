@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 
 from . import __version__
-from .auth import login_openai
+from .auth import login_antigravity, login_openai
 from .git import prepare_worktree
 from .providers import PROVIDERS, configure_provider, default_model, default_provider, is_connected, list_models, load_auth, remove_key, save_default_model, save_default_provider
 from .runner import run_task, task_home
@@ -70,7 +70,12 @@ def _interactive() -> argparse.Namespace:
     if provider not in PROVIDERS:
         raise RuntimeError(f"Unknown EVERUN_PROVIDER {provider!r}; choose from {', '.join(PROVIDERS)}")
     if not is_connected(provider):
-        action = "everrun auth login openai" if provider == "openai" else f"everrun auth set {provider}"
+        if provider == "openai":
+            action = "everrun auth login openai"
+        elif provider == "antigravity":
+            action = "everrun auth login antigravity"
+        else:
+            action = f"everrun auth set {provider}"
         raise RuntimeError(f"No {provider} account is connected. Connect it with `{action}`, then start Everrun again.")
 
     model = os.environ.get("EVERUN_MODEL") or default_model(provider)
@@ -116,8 +121,8 @@ def _main(*, ui: TerminalUI | None = None) -> None:
 
     auth = sub.add_parser("auth", help="Connect or disconnect a model provider")
     auth_sub = auth.add_subparsers(dest="auth_command", required=True)
-    login = auth_sub.add_parser("login", help="Sign in with ChatGPT for eligible OpenAI model usage")
-    login.add_argument("provider", choices=["openai"])
+    login = auth_sub.add_parser("login", help="Sign in with ChatGPT or Antigravity for model usage")
+    login.add_argument("provider", choices=["openai", "antigravity"])
     set_key = auth_sub.add_parser("set", help="Save a provider API key")
     set_key.add_argument("provider", type=_provider_name)
     set_key.add_argument("--base-url", help="Required for openai-compatible providers")
@@ -146,6 +151,8 @@ def _main(*, ui: TerminalUI | None = None) -> None:
             if not is_connected(args.provider):
                 if args.provider == "openai":
                     raise RuntimeError("Connect with `everrun auth login openai` or save an API key with `everrun auth set openai`")
+                if args.provider == "antigravity":
+                    raise RuntimeError("Connect with `everrun auth login antigravity` or save an API key with `everrun auth set antigravity`")
                 raise RuntimeError(f"Connect with `everrun auth set {args.provider}` before starting a task")
             repo = _git_root(Path(args.repo).resolve())
             task_id = uuid.uuid4().hex[:10]
@@ -225,7 +232,10 @@ def _main(*, ui: TerminalUI | None = None) -> None:
                 print(f"{model['id']}\t{model['name']}")
         elif args.command == "auth":
             if args.auth_command == "login":
-                login_openai()
+                if args.provider == "openai":
+                    login_openai()
+                elif args.provider == "antigravity":
+                    login_antigravity()
             elif args.auth_command == "set":
                 base_url = args.base_url
                 if args.provider == "openai-compatible":
@@ -252,19 +262,35 @@ def _main(*, ui: TerminalUI | None = None) -> None:
                         else:
                             detail = "not connected"
                         print(f"{provider}: {detail}")
-                    elif provider in ("gemini", "antigravity"):
-                        env_var = "GEMINI_API_KEY" if provider == "gemini" else "ANTIGRAVITY_API_KEY"
-                        saved = load_auth().get(provider, {})
-                        if os.environ.get(env_var):
-                            detail = f"connected ({env_var})"
+                    elif provider == "antigravity":
+                        saved = load_auth().get("antigravity", {})
+                        from .auth import _antigravity_token_file
+                        token_file = _antigravity_token_file()
+                        if os.environ.get("ANTIGRAVITY_API_KEY"):
+                            detail = "connected (ANTIGRAVITY_API_KEY)"
                         elif os.environ.get("GEMINI_API_KEY"):
+                            detail = "connected (GEMINI_API_KEY)"
+                        elif os.environ.get("GOOGLE_API_KEY"):
+                            detail = "connected (GOOGLE_API_KEY)"
+                        elif saved.get("auth_type") == "oauth":
+                            detail = f"connected with Antigravity{': ' + saved['email'] if saved.get('email') else ''}"
+                        elif token_file.exists():
+                            detail = "connected with Antigravity (IDE session)"
+                        elif saved.get("api_key"):
+                            detail = "connected (saved API key)"
+                        elif load_auth().get("gemini", {}).get("api_key"):
+                            detail = "connected (saved Gemini API key)"
+                        else:
+                            detail = "not connected"
+                        print(f"{provider}: {detail}")
+                    elif provider == "gemini":
+                        saved = load_auth().get("gemini", {})
+                        if os.environ.get("GEMINI_API_KEY"):
                             detail = "connected (GEMINI_API_KEY)"
                         elif os.environ.get("GOOGLE_API_KEY"):
                             detail = "connected (GOOGLE_API_KEY)"
                         elif saved.get("api_key"):
                             detail = "connected (saved API key)"
-                        elif provider == "antigravity" and load_auth().get("gemini", {}).get("api_key"):
-                            detail = "connected (saved Gemini API key)"
                         else:
                             detail = "not connected"
                         print(f"{provider}: {detail}")

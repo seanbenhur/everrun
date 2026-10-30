@@ -178,6 +178,12 @@ class ProviderTests(unittest.TestCase):
             self.assertTrue(providers.is_connected("antigravity"))
             self.assertEqual(providers._credential("antigravity"), "ag-key")
 
+        with patch.dict(os.environ, {}, clear=True), \
+                patch("everrun_harness.providers.load_auth", return_value={}), \
+                patch("everrun_harness.auth._antigravity_token_file") as mock_token_file:
+            mock_token_file.return_value.exists.return_value = True
+            self.assertTrue(providers.is_connected("antigravity"))
+
         self.assertIn("generativelanguage.googleapis.com", providers._base_url("gemini"))
         self.assertIn("generativelanguage.googleapis.com", providers._base_url("antigravity"))
 
