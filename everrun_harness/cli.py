@@ -233,8 +233,8 @@ def _main(*, ui: TerminalUI | None = None) -> None:
                         base_url = input("OpenAI-compatible base URL: ").strip()
                     api_key = getpass.getpass("API key (leave blank if not required): ")
                 elif args.provider in ("gemini", "antigravity"):
-                    label = "Antigravity" if args.provider == "antigravity" else "Gemini"
-                    api_key = getpass.getpass(f"{label} API key: ")
+                    print("Tip: Get a free Gemini API key at https://aistudio.google.com/apikey")
+                    api_key = getpass.getpass("Gemini / Antigravity API key: ")
                 else:
                     api_key = getpass.getpass(f"{args.provider} API key: ")
                 configure_provider(args.provider, api_key=api_key or None, base_url=base_url)
